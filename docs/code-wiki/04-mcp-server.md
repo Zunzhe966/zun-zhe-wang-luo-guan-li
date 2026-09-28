@@ -148,7 +148,7 @@ MCP 协议 2025-06-18 引入 `instructions` 能力：客户端会把它注入系
 
 ### 4.7 更新检查（`check_update`）
 
-- 端点：`local` → `http://127.0.0.1:7878/latest.json`（直连）；`github` → `https://github.com/Zunzhe966/magic-agent/releases/latest/download/latest.json`（**必须经节点代理端口 7893**，GitHub 直连不通）。
+- 端点：`local` → `http://127.0.0.1:7878/latest.json`（直连）；`github` → `https://github.com/Zunzhe966/zun-zhe-wang-luo-guan-li/releases/latest/download/latest.json`（**必须经节点代理端口 7893**，GitHub 直连不通）。
 - 当前版本读 `src-tauri/tauri.conf.json` 的 `version`。
 - 版本比较 `_v()` 把 `x.y.z` 拆成元组比较；返回 `available = latest > current`。
 - **只读**：不下载、不安装；安装交由用户在 App 设置页操作。

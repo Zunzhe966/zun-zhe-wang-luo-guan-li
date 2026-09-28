@@ -43,7 +43,7 @@ UIPKG="$ROOT/ui/package.json"
 KEY="$HOME/.tauri/magic-agent.key"
 
 # GitHub 仓库（源码与 Release 同仓库，避免两套东西不同步）
-GH_REPO="Zunzhe966/magic-agent"
+GH_REPO="Zunzhe966/zun-zhe-wang-luo-guan-li"
 GH_TAG="v$VER"
 
 if [ ! -f "$KEY" ]; then

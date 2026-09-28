@@ -7,7 +7,7 @@
 //! | 通道 | 端点 | 使用者 |
 //! |---|---|---|
 //! | 本地 `local` | `http://127.0.0.1:7878/latest.json` | 开发者自己（本机起 http.server 调试） |
-//! | GitHub `github` | `https://github.com/Zunzhe966/magic-agent/releases/latest/download/latest.json` | 真正的终端用户 |
+//! | GitHub `github` | `https://github.com/Zunzhe966/zun-zhe-wang-luo-guan-li/releases/latest/download/latest.json` | 真正的终端用户 |
 //!
 //! 两个通道指向**同一份**更新包与同一份签名（`release.sh` 一次构建产出），
 //! 只是 latest.json 里写的下载地址不同 —— 因此不存在两边不同步的问题。
@@ -32,7 +32,7 @@ pub const ENDPOINT_LOCAL: &str = "http://127.0.0.1:7878/latest.json";
 /// 这是给真实用户用的；发版脚本把同一份 feed 上传到 Release 资产即可。
 /// 用源码仓库本身承载 Release —— 源码与发布天然同源，避免两套东西不同步。
 pub const ENDPOINT_GITHUB: &str =
-    "https://github.com/Zunzhe966/magic-agent/releases/latest/download/latest.json";
+    "https://github.com/Zunzhe966/zun-zhe-wang-luo-guan-li/releases/latest/download/latest.json";
 
 /// 缺省通道：面向真实用户，所以默认走 GitHub。
 pub const DEFAULT_CHANNEL: &str = "github";

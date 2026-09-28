@@ -46,7 +46,7 @@
     "updater": {
       "active": true,
       "endpoints": [
-        "https://github.com/Zunzhe966/magic-agent/releases/latest/download/latest.json"
+        "https://github.com/Zunzhe966/zun-zhe-wang-luo-guan-li/releases/latest/download/latest.json"
       ],
       "dialog": false,
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEYzNDM4REZDNDkyMzIwNzQKUldSMElDTkovSTFEODFBNUtlYmRxallORkE3bko1ZiszOHVIV0VsU2NGSTRLK1lGdUhyM2xSajgK",

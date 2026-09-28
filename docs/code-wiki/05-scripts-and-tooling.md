@@ -39,7 +39,7 @@ scripts/
 | feed | 目录 | 包 URL |
 |---|---|---|
 | 本地测试 | `scripts/updater-feed/latest.json` | `http://127.0.0.1:7878/<包名>` |
-| 公开发布 | `scripts/updater-feed-publish/latest.json` | `https://github.com/Zunzhe966/magic-agent/releases/download/v<ver>/<asset>` |
+| 公开发布 | `scripts/updater-feed-publish/latest.json` | `https://github.com/Zunzhe966/zun-zhe-wang-luo-guan-li/releases/download/v<ver>/<asset>` |
 
 两边 **signature 完全相同**（同一把 `~/.tauri/magic-agent.key` 私钥签的），App 两个通道也用同一把公钥验签 → 本地与 GitHub 永远是同一份东西，不存在不同步。
 

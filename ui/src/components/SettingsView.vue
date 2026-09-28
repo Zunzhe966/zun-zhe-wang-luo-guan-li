@@ -105,7 +105,7 @@ const channels = [
     id: 'github',
     name: 'GitHub 公开发布',
     desc: '从 GitHub Releases 拉取更新包，面向所有终端用户，无需本机服务。',
-    endpoint: 'https://github.com/Zunzhe966/magic-agent/releases/latest/download/latest.json',
+    endpoint: 'https://github.com/Zunzhe966/zun-zhe-wang-luo-guan-li/releases/latest/download/latest.json',
   },
 ];
 

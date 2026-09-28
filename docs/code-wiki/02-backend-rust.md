@@ -471,7 +471,7 @@ drain 是为防止远端输出超 64KB（macOS 管道缓冲）导致子进程写
 | 常量 | 值 |
 |---|---|
 | `ENDPOINT_LOCAL` | `http://127.0.0.1:7878/latest.json` |
-| `ENDPOINT_GITHUB` | `https://github.com/Zunzhe966/magic-agent/releases/latest/download/latest.json` |
+| `ENDPOINT_GITHUB` | `https://github.com/Zunzhe966/zun-zhe-wang-luo-guan-li/releases/latest/download/latest.json` |
 | `DEFAULT_CHANNEL` | `"github"` |
 
 > 为什么需要运行时切端点：Tauri updater 的 endpoint 在**编译期固定**，运行时只能用

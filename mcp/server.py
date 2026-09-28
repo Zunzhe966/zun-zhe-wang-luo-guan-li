@@ -2094,7 +2094,7 @@ def check_update(args):
     if channel not in ('local', 'github'):
         channel = 'github'
     endpoint = ('http://127.0.0.1:7878/latest.json' if channel == 'local' else
-                'https://github.com/Zunzhe966/magic-agent/releases/latest/download/latest.json')
+                'https://github.com/Zunzhe966/zun-zhe-wang-luo-guan-li/releases/latest/download/latest.json')
     # 当前版本：以源码 tauri.conf.json 为准（与本机开发构建一致）
     try:
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -2162,7 +2162,7 @@ def apply_update(args):
     if channel not in ('local', 'github'):
         channel = 'github'
     feed_url = ('http://127.0.0.1:7878/latest.json' if channel == 'local' else
-                'https://github.com/Zunzhe966/magic-agent/releases/latest/download/latest.json')
+                'https://github.com/Zunzhe966/zun-zhe-wang-luo-guan-li/releases/latest/download/latest.json')
     try:
         if channel == 'local':
             feed = json.loads(_OPENER.open(feed_url, timeout=5).read())
@@ -2182,7 +2182,7 @@ def apply_update(args):
     if channel == 'local':
         if not pkg_url.startswith('http://127.0.0.1:7878/'):
             return {'error': f'local 通道包 URL 不在 loopback: {pkg_url}'}
-    elif not pkg_url.startswith('https://github.com/Zunzhe966/magic-agent/releases/download/'):
+    elif not pkg_url.startswith('https://github.com/Zunzhe966/zun-zhe-wang-luo-guan-li/releases/download/'):
         return {'error': f'github 通道包 URL 不在允许域名: {pkg_url}'}
     tmpdir = tempfile.mkdtemp(prefix='magic-agent-update-')
     tar_path = os.path.join(tmpdir, 'update.tar.gz')

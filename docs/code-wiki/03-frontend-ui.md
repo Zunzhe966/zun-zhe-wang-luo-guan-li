@@ -139,7 +139,7 @@ main.js
 - 无 props。版本号 `getVersion()`（Tauri app API）。
 - 更新状态直接读全局 `updaterState`，`statusText` 把状态机映射成中文；`downloading/installing` 时显示进度条。
 - **更新通道单选**：`channelModel` 是**可写 computed**（get 读 `updaterState.channel`，set 调 `selectChannel`）——旧实现用 `:checked + @change` 会出现"点了没反应但界面已选中"的状态不同步。
-- 通道列表（写死）：`local`（`http://127.0.0.1:7878/latest.json`）与 `github`（`https://github.com/Zunzhe966/magic-agent/releases/latest/download/latest.json`）。
+- 通道列表（写死）：`local`（`http://127.0.0.1:7878/latest.json`）与 `github`（`https://github.com/Zunzhe966/zun-zhe-wang-luo-guan-li/releases/latest/download/latest.json`）。
 - `channelHint`：选了 local 时提示需先在终端 `cd scripts/updater-feed && python3 -m http.server 7878 --bind 127.0.0.1`。
 
 ---
