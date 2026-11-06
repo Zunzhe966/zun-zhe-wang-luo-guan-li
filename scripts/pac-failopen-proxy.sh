@@ -72,7 +72,9 @@ gen_pac() {
 }
 
 pac_pid() {
-  /usr/bin/pgrep -f "http.server $PAC_PORT --directory" 2>/dev/null | head -1
+  # 注意：实际命令是 `python3 -m http.server <port> --bind 127.0.0.1 --directory <dir>`，
+  # 「port 与 --directory 相邻」并不成立——旧模式因此匹配不到，off 时杀不掉服务。
+  /usr/bin/pgrep -f "http\.server ${PAC_PORT}( |$)" 2>/dev/null | head -1
 }
 
 serve_pac() {

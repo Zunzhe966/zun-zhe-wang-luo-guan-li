@@ -117,6 +117,9 @@ pub struct PacServer {
     pub url: String,
     pub port: u16,
     body: Arc<Mutex<String>>,
+    /// 停止信号：listener 在子线程里，drop PacServer 不会关端口，
+    /// 必须显式置位让 accept 循环退出（否则 stop 后端口仍被占，下次启动顺延）。
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PacServer {
@@ -128,18 +131,32 @@ impl PacServer {
                 Ok(listener) => {
                     let shared = Arc::new(Mutex::new(body));
                     let body_for_thread = shared.clone();
+                    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let shutdown_for_thread = shutdown.clone();
+                    let _ = listener.set_nonblocking(true);
                     std::thread::spawn(move || {
-                        for conn in listener.incoming() {
-                            let Ok(stream) = conn else { continue };
-                            let b = body_for_thread.clone();
-                            // 每连接一个短线程：PAC 请求很少，无需线程池
-                            std::thread::spawn(move || serve_one(stream, b));
+                        use std::sync::atomic::Ordering;
+                        loop {
+                            if shutdown_for_thread.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            match listener.accept() {
+                                Ok((stream, _)) => {
+                                    let b = body_for_thread.clone();
+                                    std::thread::spawn(move || serve_one(stream, b));
+                                }
+                                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                    std::thread::sleep(std::time::Duration::from_millis(50));
+                                }
+                                Err(_) => break,
+                            }
                         }
                     });
                     return Ok(PacServer {
                         url: format!("http://127.0.0.1:{port}/proxy.pac"),
                         port,
                         body: shared,
+                        shutdown,
                     });
                 }
                 Err(e) => last_err = e.to_string(),
@@ -156,6 +173,16 @@ impl PacServer {
 
     pub fn body_snapshot(&self) -> String {
         self.body.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// 主动停止：置位让 accept 循环退出并释放端口。
+    pub fn shutdown(&self) {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn is_shutdown(&self) -> bool {
+        self.shutdown.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -221,7 +248,10 @@ pub fn current_url() -> Option<String> {
 
 pub fn stop() {
     if let Ok(mut g) = slot().lock() {
-        *g = None; // 释放监听：线程随 listener drop 退出
+        if let Some(s) = g.as_ref() {
+            s.shutdown();
+        }
+        *g = None;
     }
 }
 
@@ -314,5 +344,10 @@ mod tests {
         assert!(TcpStream::connect(("127.0.0.1", s.port)).is_ok());
         s.update(build_pac(7891, &["b.com".into()]));
         assert!(s.body_snapshot().contains("\"b.com\""));
+        assert!(!s.is_shutdown());
+        // 停止后端口必须真的释放（回归：listener 在子线程里，drop 不会关端口）
+        s.shutdown();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(TcpStream::connect(("127.0.0.1", s.port)).is_err());
     }
 }

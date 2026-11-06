@@ -600,6 +600,34 @@ mod tests {
     ///     Enabled: Yes / Server: 127.0.0.1 / Port: 7891 / Authenticated Proxy Enabled: 0
     /// 教训：上一版测试 fixture 用臆测的 "Web Proxy ... is Enabled." 格式，与真机完全不符，
     /// 纯 mock 测试因此全绿但真实对账恒失败。任何解析逻辑改动必须先跑真机输出对格式。
+    /// 真机集成（手动执行）：真实下发 PAC 再撤回，验证"开得起来也关得干净"。
+    /// 默认 `#[ignore]`，因为它会真改本机网络设置。
+    ///     cargo test --offline -- --ignored real_machine_pac
+    #[test]
+    #[ignore = "真机集成：会真实改写系统代理设置，仅在手动执行时运行"]
+    fn real_machine_pac_apply_then_clear() {
+        let url = crate::pac::ensure_running(crate::pac::build_pac(
+            7891,
+            &["example.com".to_string()],
+        ))
+        .expect("PAC 服务应能启动");
+        assert!(url.starts_with("http://127.0.0.1:"));
+
+        let r = apply_pac(&url).expect("apply_pac 应成功");
+        assert!(!r.services.is_empty(), "应至少枚举到一个网络服务");
+        let enabled = r.services.iter().filter(|s| s.enabled && s.url == url).count();
+        assert!(enabled >= 1, "至少一个服务应读到 PAC 已启用: {:?}", r.services);
+        assert!(pac_enabled_globally(), "scutil 全局视图应显示 PAC 已开");
+
+        // 收尾必须是"关 PAC + 关全局 + 清脏地址"
+        let errs = disable_everything();
+        assert!(errs.is_empty(), "收尾应无错误: {errs:?}");
+        assert!(!pac_enabled_globally(), "收尾后 PAC 应关闭");
+        let st = status();
+        assert!(!st.enabled, "收尾后全局代理应关闭");
+        crate::pac::stop();
+    }
+
     #[test]
     fn parse_autoproxy_reads_real_output() {
         // 真机实测（Darwin 25.x，networksetup -getautoproxyurl "Thunderbolt Bridge"）
