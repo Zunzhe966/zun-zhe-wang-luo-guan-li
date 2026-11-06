@@ -993,9 +993,14 @@ mod tests {
 
     #[test]
     fn validate_public_host_blocks_domain_resolving_to_localhost() {
-        // 域名解析到回环地址，应被 SSRF 防护拦截（堵住域名绕过）
+        // 域名解析到回环地址，应被 SSRF 防护拦截（堵住域名绕过）。
+        // 注意：本用例依赖本机 DNS/Hosts 能否解析该名字——"localhost" 由
+        // /etc/hosts 保证，其余别名（如 localhost.localdomain）在部分机器上
+        // 解析失败，届时函数按"无法验证 → 放行"返回 Ok，属预期行为，
+        // 不能拿来做断言（v0.4.2 修掉这条环境敏感断言，避免假红）。
         assert!(validate_public_host("localhost").is_err());
-        assert!(validate_public_host("localhost.localdomain").is_err());
+        assert!(validate_public_host("localhost:8080").is_err());
+        assert!(validate_public_host("[::1]:443").is_err());
     }
 
     #[test]

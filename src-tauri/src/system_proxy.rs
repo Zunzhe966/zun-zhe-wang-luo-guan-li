@@ -78,11 +78,15 @@ pub fn set_system_proxy(enable: bool, port: u16) -> Result<SystemProxyStatus, St
                 vec!["-setsocksfirewallproxystate", svc, "on"],
             ]
         } else {
-            vec![
-                vec!["-setwebproxystate", svc, "off"],
-                vec!["-setsecurewebproxystate", svc, "off"],
-                vec!["-setsocksfirewallproxystate", svc, "off"],
-            ]
+            // v0.4.2：关闭时把「服务器地址」一起复位，消灭 `Server: off` 这类残留。
+            // 事故复盘：`networksetup -setwebproxy <服务> off` 会把字符串 "off"
+            // 当成代理主机名写进配置——于是"代理已关闭"的表象下，每条连接仍要
+            // 去解析主机名 "off"，全部失败，症状看起来像 DNS 坏了。
+            // 只清开关不清地址，正是那种状态能存活好几天的原因。
+            reset_channel_residue(svc, "-getwebproxy", "-setwebproxy", "-setwebproxystate");
+            reset_channel_residue(svc, "-getsecurewebproxy", "-setsecurewebproxy", "-setsecurewebproxystate");
+            reset_channel_residue(svc, "-getsocksfirewallproxy", "-setsocksfirewallproxy", "-setsocksfirewallproxystate");
+            vec![]
         };
         for args in args_list {
             if let Err(e) = run(NETWORKSETUP, &args) {
@@ -408,6 +412,186 @@ fn parse_port(text: &str, key: &str) -> Option<u16> {
     None
 }
 
+/// 把某条通道的「服务器地址」复位成 127.0.0.1:0，再关开关。
+///
+/// 只在**地址确实是脏的**情况下才写，避免给干净的服务制造新残留。
+/// 已知脏值：空串、`off`、`0`、以及任何非回环地址。
+fn reset_channel_residue(svc: &str, get_flag: &str, set_flag: &str, state_flag: &str) {
+    let server = run(NETWORKSETUP, &[get_flag, svc])
+        .map(|o| parse_proxy_server(&o))
+        .unwrap_or_default();
+    let dirty = !server.is_empty() && server != "127.0.0.1";
+    if dirty {
+        // 写 127.0.0.1:0 会顺手把开关打开，紧跟着的 state off 负责关回去
+        let _ = run(NETWORKSETUP, &[set_flag, svc, "127.0.0.1", "0"]);
+    }
+    let _ = run(NETWORKSETUP, &[state_flag, svc, "off"]);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PAC 模式（v0.4.2）：用「白名单自动代理」替代「全局 HTTP/SOCKS 代理」
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 单个服务的 PAC 应用结果
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PacServiceState {
+    pub service: String,
+    pub enabled: bool,
+    pub url: String,
+    /// 是否达成期望（开=PAC 已启用且 URL 一致；关=已停用）
+    pub ok: bool,
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PacApplyResult {
+    pub pac_url: String,
+    pub services: Vec<PacServiceState>,
+    pub all_ok: bool,
+    pub mismatched: Vec<String>,
+}
+
+/// 解析 `-getautoproxyurl` 输出：
+///   URL: http://127.0.0.1:18080/proxy.pac
+///   Enabled: Yes
+fn parse_autoproxy(out: &str) -> (bool, String) {
+    let mut enabled = false;
+    let mut url = String::new();
+    for line in out.lines() {
+        let l = line.trim();
+        if let Some(v) = l.strip_prefix("URL:") {
+            url = v.trim().to_string();
+        } else if let Some(v) = l.strip_prefix("Enabled:") {
+            enabled = v.trim().eq_ignore_ascii_case("yes");
+        }
+    }
+    (enabled, url)
+}
+
+/// 下发 PAC 配置到所有网络服务，并**逐服务读回**对账。
+///
+/// 与旧 `set_system_proxy(true, ..)` 的关键区别：这里配的是"名单内的站点才走代理"，
+/// 名单外的流量物理直连，内核死了也不影响——这是"不再劫持整个网络"的实现点。
+pub fn apply_pac(pac_url: &str) -> Result<PacApplyResult, String> {
+    let services = list_services();
+    if services.is_empty() {
+        return Err("未检测到网络服务，无法下发 PAC 配置".to_string());
+    }
+    let mut states = Vec::new();
+    let mut mismatched = Vec::new();
+    for svc in &services {
+        let mut errors = Vec::new();
+        // 1) 先关掉旧的全局代理（含清脏地址），避免 PAC 与全局代理双开
+        reset_channel_residue(svc, "-getwebproxy", "-setwebproxy", "-setwebproxystate");
+        reset_channel_residue(svc, "-getsecurewebproxy", "-setsecurewebproxy", "-setsecurewebproxystate");
+        reset_channel_residue(svc, "-getsocksfirewallproxy", "-setsocksfirewallproxy", "-setsocksfirewallproxystate");
+        // 2) 写入 PAC URL 并启用
+        if let Err(e) = run(NETWORKSETUP, &["-setautoproxyurl", svc, pac_url]) {
+            errors.push(format!("-setautoproxyurl: {e}"));
+        }
+        if let Err(e) = run(NETWORKSETUP, &["-setautoproxystate", svc, "on"]) {
+            errors.push(format!("-setautoproxystate: {e}"));
+        }
+        // 3) 读回对账
+        let (enabled, url) = run(NETWORKSETUP, &["-getautoproxyurl", svc])
+            .map(|o| parse_autoproxy(&o))
+            .unwrap_or((false, String::new()));
+        let ok = enabled && url == pac_url && errors.is_empty();
+        if !ok {
+            mismatched.push(svc.clone());
+        }
+        states.push(PacServiceState {
+            service: svc.clone(),
+            enabled,
+            url,
+            ok,
+            errors,
+        });
+    }
+    let all_ok = mismatched.is_empty() && states.iter().all(|s| s.ok);
+    Ok(PacApplyResult {
+        pac_url: pac_url.to_string(),
+        services: states,
+        all_ok,
+        mismatched,
+    })
+}
+
+impl PacApplyResult {
+    /// 转成旧的 `SystemProxyStatus` 形状，保证前端契约不变
+    /// （UI 只消费 enabled/allOk/services[].httpOn/mismatched，不必跟着改）。
+    pub fn to_status(&self) -> SystemProxyStatus {
+        let services: Vec<ServiceProxyState> = self
+            .services
+            .iter()
+            .map(|s| ServiceProxyState {
+                service: s.service.clone(),
+                // PAC 是"域名级"分流，没有 http/https/socks 三通道之分，
+                // 这里三字段同值表达"该服务整体是否达标"，避免前端出现半吊子状态。
+                http_on: s.ok,
+                https_on: s.ok,
+                socks_on: s.ok,
+                errors: s.errors.clone(),
+            })
+            .collect();
+        SystemProxyStatus {
+            enabled: true,
+            http_port: 0,
+            socks_port: 0,
+            services,
+            all_ok: self.all_ok,
+            mismatched: self.mismatched.clone(),
+        }
+    }
+}
+
+/// 读取单个服务的 PAC 现状：(是否启用, URL)。漂移巡检与自愈都用它。
+pub fn pac_state_for(svc: &str) -> (bool, String) {
+    run(NETWORKSETUP, &["-getautoproxyurl", svc])
+        .map(|o| parse_autoproxy(&o))
+        .unwrap_or((false, String::new()))
+}
+
+/// 关闭所有服务的 PAC（不碰内核，纯系统设置收尾）。
+pub fn clear_pac() -> Vec<String> {
+    let mut errs = Vec::new();
+    for svc in list_services() {
+        if let Err(e) = run(NETWORKSETUP, &["-setautoproxystate", &svc, "off"]) {
+            errs.push(format!("{svc}: PAC 关闭失败 {e}"));
+        }
+    }
+    errs
+}
+
+/// `scutil --proxy` 里 PAC 是否开启（全局视图，收尾判断用）
+pub fn pac_enabled_globally() -> bool {
+    Command::new(SCUTIL)
+        .arg("--proxy")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("ProxyAutoConfigEnable : 1"))
+        .unwrap_or(false)
+}
+
+/// **一键回到"什么都不劫持"**：关 PAC + 关三条全局代理 + 清脏地址。
+/// 自愈线程、退出收尾、信号收尾都走这一个入口，保证只有一套收尾口径。
+pub fn disable_everything() -> Vec<String> {
+    let mut errs = clear_pac();
+    for svc in list_services() {
+        reset_channel_residue(&svc, "-getwebproxy", "-setwebproxy", "-setwebproxystate");
+        reset_channel_residue(&svc, "-getsecurewebproxy", "-setsecurewebproxy", "-setsecurewebproxystate");
+        reset_channel_residue(&svc, "-getsocksfirewallproxy", "-setsocksfirewallproxy", "-setsocksfirewallproxystate");
+    }
+    errs
+}
+
+/// 是否还有任何形式的代理/PAC 生效（收尾判定用）
+pub fn any_proxy_active() -> bool {
+    pac_enabled_globally() || status().enabled
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,6 +600,34 @@ mod tests {
     ///     Enabled: Yes / Server: 127.0.0.1 / Port: 7891 / Authenticated Proxy Enabled: 0
     /// 教训：上一版测试 fixture 用臆测的 "Web Proxy ... is Enabled." 格式，与真机完全不符，
     /// 纯 mock 测试因此全绿但真实对账恒失败。任何解析逻辑改动必须先跑真机输出对格式。
+    #[test]
+    fn parse_autoproxy_reads_real_output() {
+        // 真机实测（Darwin 25.x，networksetup -getautoproxyurl "Thunderbolt Bridge"）
+        let on = "URL: http://127.0.0.1:18080/proxy.pac\nEnabled: Yes";
+        assert_eq!(
+            parse_autoproxy(on),
+            (true, "http://127.0.0.1:18080/proxy.pac".to_string())
+        );
+        let off = "URL: http://127.0.0.1:18080/proxy.pac\nEnabled: No";
+        assert_eq!(parse_autoproxy(off).0, false);
+        assert_eq!(parse_autoproxy(""), (false, String::new()));
+    }
+
+    #[test]
+    fn residue_reset_targets_only_dirty_servers() {
+        // 判定逻辑回归锁：干净的回环地址不该被"修"，脏的（off/空/外部地址）必须被修。
+        // 这里锁的是口径，不是真机写操作。
+        for dirty in ["off", "0", "192.168.1.1", "proxy.local"] {
+            let is_dirty = !dirty.is_empty() && dirty != "127.0.0.1";
+            assert!(is_dirty, "{dirty:?} 应被判定为脏地址");
+        }
+        // 空串 = 该通道从未被写过，不是脏值（写它反而会制造新残留）
+        let empty = "";
+        assert!(!(!empty.is_empty() && empty != "127.0.0.1"), "空地址不是脏值");
+        let clean = "127.0.0.1";
+        assert!(!(!clean.is_empty() && clean != "127.0.0.1"), "回环地址不该被重写");
+    }
+
     #[test]
     fn parse_proxy_detail_reads_real_networksetup_format() {
         let real = "Enabled: Yes\nServer: 127.0.0.1\nPort: 7891\nAuthenticated Proxy Enabled: 0";

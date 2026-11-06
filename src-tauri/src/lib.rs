@@ -1,5 +1,7 @@
 mod apps;
 mod auditor;
+mod dns_guard;
+mod pac;
 // config / mihomo 对 bin 工具（dump_conf）公开
 pub mod config;
 mod keychain;
@@ -204,6 +206,54 @@ fn log_proxy_set_result(caller: &str, r: &system_proxy::SystemProxyStatus) {
     }
 }
 
+/// 把系统代理切成 **PAC 白名单模式**（v0.4.2 核心改造）。
+///
+/// 与旧 `set_system_proxy(true, port)` 的区别：不再把三条全局代理通道指向本机
+/// 端口（那等于"劫持整个网络"——内核一死，连 GEOSITE,cn→DIRECT 都执行不到），
+/// 而是下发一条 PAC：**名单内的域名走 127.0.0.1:port，且带 `; DIRECT` 回退**，
+/// 其余流量物理直连。
+///
+/// 失败策略：PAC 服务起不来就**不接管**（返回 Err），绝不降级成全局代理——
+/// 降级等于把这次事故的根因重新埋回去。
+fn apply_pac_mode(
+    cfg: &AppConfig,
+    port: u16,
+    caller: &str,
+) -> Result<system_proxy::PacApplyResult, String> {
+    let domains = pac::proxy_domains_from_config(cfg);
+    let body = pac::build_pac(port, &domains);
+    let url = pac::ensure_running(body)?;
+    let r = system_proxy::apply_pac(&url)?;
+    eprintln!(
+        "[pac] {caller}: 白名单 {} 个域名走代理，{} 个网络服务已下发（allOk={}）",
+        domains.len(),
+        r.services.len(),
+        r.all_ok
+    );
+    if !r.all_ok {
+        eprintln!(
+            "[pac] WARN {caller}: 未达标服务 {}（原因见 services.errors）",
+            if r.mismatched.is_empty() { "见明细".to_string() } else { r.mismatched.join("、") }
+        );
+    }
+    Ok(r)
+}
+
+/// 唯一收尾入口：关 PAC + 关三条全局代理 + 清脏地址（`Server: off` 那类）。
+/// 自愈、退出、信号、看门狗失败分支都走这里，保证只有一套口径。
+fn disable_all_proxy(caller: &str) {
+    let errs = system_proxy::disable_everything();
+    if errs.is_empty() {
+        eprintln!("[system_proxy] {caller}: PAC 与全局代理已全部关闭，系统回到纯直连");
+    } else {
+        eprintln!(
+            "[system_proxy] WARN {caller}: 部分关闭失败（用户可能仍无网，重启 App 可自愈）: {}",
+            errs.join("；")
+        );
+    }
+    pac::stop();
+}
+
 /// 启动网络管理前，清理所有第三方代理：
 /// 1) 杀掉第三方代理进程（先温和 TERM，1.5 秒后仍在则 KILL）
 /// 2) 关闭系统代理设置，让网络回到"未设代理"的干净状态
@@ -219,9 +269,7 @@ fn cleanup_foreign_proxies() -> Vec<String> {
     let mut cleaned = Vec::new();
     if victims.is_empty() {
         // 没有第三方进程，但仍要确保系统代理是干净状态
-        if let Ok(r) = system_proxy::set_system_proxy(false, 0) {
-            log_proxy_set_result("cleanup(无第三方)", &r);
-        }
+        disable_all_proxy("cleanup(无第三方)");
         return cleaned;
     }
 
@@ -251,9 +299,7 @@ fn cleanup_foreign_proxies() -> Vec<String> {
     }
 
     // 关闭系统代理，回到干净状态（第三方软件可能残留了代理指向）
-    if let Ok(r) = system_proxy::set_system_proxy(false, 0) {
-        log_proxy_set_result("cleanup", &r);
-    }
+    disable_all_proxy("cleanup");
 
     cleaned
 }
@@ -494,27 +540,17 @@ fn startup_self_check(state: &Arc<Mutex<AppState>>) {
         "[self-check] 检测到系统代理指向本程序死端口（http={} socks={}）但内核未运行，自动关闭以恢复直连",
         sys.http_port, sys.socks_port
     );
-    match system_proxy::set_system_proxy(false, mihomo.port) {
-        Ok(r) => {
-            let mut notice = format!(
-                "检测到上次异常退出残留的系统代理（指向已停止的端口 {}），已自动关闭恢复直连。",
-                if sys.http_port != 0 { sys.http_port } else { sys.socks_port }
-            );
-            if !r.all_ok {
-                notice.push_str(&format!(
-                    "注意：{} 个服务未能确认关闭：{}",
-                    r.mismatched.len(),
-                    r.mismatched.join("、")
-                ));
-            }
-            *heal_slot.lock().unwrap() = Some(notice);
-        }
-        Err(e) => {
-            *heal_slot.lock().unwrap() = Some(format!(
-                "检测到系统代理残留指向本程序死端口，但自动关闭失败：{e}。请手动检查网络设置。"
-            ));
-        }
-    }
+    let errs = system_proxy::disable_everything();
+    pac::stop();
+    let notice = format!(
+        "检测到上次异常退出残留的代理设置（指向已停止的端口 {}），已自动关闭恢复直连。",
+        if sys.http_port != 0 { sys.http_port } else { sys.socks_port }
+    );
+    *heal_slot.lock().unwrap() = Some(if errs.is_empty() {
+        notice
+    } else {
+        format!("{notice}但以下项目未能确认关闭：{}，请手动检查网络设置。", errs.join("；"))
+    });
 }
 
 /// P1-4 漂移判定（纯函数，供单测直接喂假读回结果）：
@@ -536,20 +572,69 @@ fn judge_drift(mismatched: &[String], drift_ack: bool) -> Option<Vec<String>> {
 /// P1-4 漂移抽验（看门狗每 5 分钟调用）：只跑一次逐服务读回对账，
 /// 不写任何状态、不杀任何进程——发现漂移只记录，处置权在用户
 /// （黄条 [重新归位] / [接受]）。
-fn probe_drift(port: u16, drift_ack: bool) -> Option<Vec<String>> {
+/// PAC 漂移抽验（看门狗每 5 分钟调用）：接管生效中，每个服务都应当
+/// "PAC 已启用且 URL 指向本程序的 PAC 服务"。只读不写，发现漂移仅记录。
+///
+/// v0.4.2 口径变更：不再用 `verify_system_proxy(expect_on=true)`（那是"全局代理
+/// 指向本程序端口"的旧口径）。PAC 模式下全局代理本来就应当是关的，
+/// 继续用旧口径会把正常状态误报成漂移。
+fn probe_drift_pac(drift_ack: bool) -> Option<Vec<String>> {
     let services = system_proxy::list_services();
     if services.is_empty() {
         return None; // 枚举不了服务 = 无从判定，宁可不报也不瞎报
     }
-    let states = system_proxy::verify_system_proxy(&services, port, true);
-    let mut mismatched: Vec<String> = states
-        .iter()
-        .filter(|st| !(st.http_on && st.https_on && st.socks_on) || !st.errors.is_empty())
-        .map(|st| st.service.clone())
-        .collect();
-    // 去重保序（verify 每服务只出一条，理论上无重复，防御性处理）
+    let mut mismatched: Vec<String> = Vec::new();
+    for svc in &services {
+        let (enabled, url) = system_proxy::pac_state_for(svc);
+        let ok = enabled && !url.is_empty();
+        if !ok {
+            mismatched.push(svc.clone());
+        }
+    }
+    // 去重保序（防御性处理）
     mismatched.dedup();
     judge_drift(&mismatched, drift_ack)
+}
+
+/// 【DNS 体检】只读。回答"这台机器现在到底能不能把域名解析成 IP"，
+/// 以及"是不是有服务被手工写死了 DNS"（015 事故的直接诱因）。
+#[tauri::command]
+async fn check_dns() -> Result<dns_guard::DnsHealth, String> {
+    tauri::async_runtime::spawn_blocking(dns_guard::check)
+        .await
+        .map_err(|e| format!("DNS 体检线程异常: {e}"))
+}
+
+/// 【修复 DNS】把手工写死的 DNS 改回 `Empty`（重新继承 DHCP 下发）。
+/// 只做这一件事、只改被写死的服务、并把原值回报给 UI——绝不静默改系统配置。
+/// 改完立刻复检一次，把"修好了没有"如实告诉调用方。
+#[tauri::command]
+async fn repair_dns() -> Result<String, String> {
+    let (done, before) = tauri::async_runtime::spawn_blocking(|| dns_guard::repair_to_dhcp(None))
+        .await
+        .map_err(|e| format!("修复 DNS 线程异常: {e}"))??;
+    // 给 configd 一点时间重新下发（真机实测 300ms 足够，读回才有意义）
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let after = tauri::async_runtime::spawn_blocking(dns_guard::check)
+        .await
+        .map_err(|e| format!("复检线程异常: {e}"))?;
+    if done.is_empty() {
+        return Ok(format!(
+            "没有检测到被手工写死的 DNS（{}）。当前解析状态：{}",
+            "各服务均继承 DHCP",
+            after.note
+        ));
+    }
+    let detail = before
+        .iter()
+        .map(|(svc, old)| format!("{}（原值 {}）", svc, if old.is_empty() { "空".to_string() } else { old.join("/") }))
+        .collect::<Vec<_>>()
+        .join("、");
+    Ok(format!(
+        "已把 {} 的 DNS 改回 DHCP 自动获取。复检：{}",
+        detail,
+        if after.ok { format!("解析已恢复（{}）", after.servers.join("、")) } else { after.note }
+    ))
 }
 
 #[tauri::command]
@@ -952,10 +1037,9 @@ async fn start_proxy(
         // 必须开着。TUN 不承载流量（auto-route=false 红线冻结），系统代理是引擎唯一
         // 流量入口——入口关着 = 内核空转，正是"点了启动却看不到真实连接"的根因。
         let m = MihomoManager::new();
-        // P0-1：不吞失败——逐服务对账结果如实记日志。
-        match system_proxy::set_system_proxy(true, m.port) {
-            Ok(r) => log_proxy_set_result("start(已运行)", &r),
-            Err(e) => eprintln!("[start_proxy] 系统代理设置失败: {e}"),
+        // P0-1：不吞失败——逐服务对账结果如实记日志。v0.4.2：改为 PAC 白名单下发。
+        if let Err(e) = apply_pac_mode(&cfg, m.port, "start(已运行)") {
+            eprintln!("[start_proxy] PAC 下发失败: {e}");
         }
         let status = m.status();
         // 意图对齐落盘：接管生效即入口在开，纠正历史 false 意图（与漂移巡检口径一致）；
@@ -995,6 +1079,24 @@ async fn start_proxy(
         if cfg.nodes.is_empty() {
             return Err("尚未添加任何代理节点，请先到「云服务器」页添加节点或拉取订阅".to_string());
         }
+        // ── v0.4.2 DNS 闸门（015 事故整改）──
+        // 事故现场：Wi-Fi 的 DNS 被钉死在一个不应答的地址上，系统"已连接"但
+        // 所有域名都解析不出来。此时若继续接管，会把一层故障叠成两层
+        // （DNS 坏 + 代理指死端口），用户看到的就是"整机没网"。
+        // 立场：DNS 不健康时**拒绝接管**，并如实说明原因与修复入口。
+        let dns = crate::dns_guard::check();
+        if !dns.ok {
+            return Err(format!(
+                "接管已中止：{}。请先在总览页点「修复 DNS」（把手工写死的 DNS 改回 DHCP 自动获取），或手动检查 系统设置 → 网络 → DNS。",
+                dns.note
+            ));
+        }
+        eprintln!(
+            "[start_proxy] DNS 体检通过（{}）；手工钉死的服务: {}",
+            dns.servers.join("、"),
+            if dns.manual_services.is_empty() { "无".to_string() } else { dns.manual_services.join("、") }
+        );
+
         // 用户点「启动代理」= 显式接管：先记账（快照逐服务原值）再清理第三方代理
         // （杀 FlClash/Clash 等 + 关系统代理），让系统回到「未设代理」的干净状态，
         // 再启动本程序的代理。
@@ -1019,20 +1121,19 @@ async fn start_proxy(
         // 不达标 = 半套秩序（部分网络走代理部分裸奔），这正是"报假账"要消灭的
         // 状态——宁可不启：停内核 + 按账本回放系统代理原值 + 结账，并向用户报错。
         // 已知不可逆项如实声明：cleanup 杀掉的第三方进程不会自动复活。
-        let verify = match system_proxy::set_system_proxy(true, mihomo.port) {
+        let verify = match apply_pac_mode(&cfg, mihomo.port, "start") {
             Ok(r) => {
-                log_proxy_set_result("start", &r);
                 if r.all_ok {
                     None
                 } else {
                     Some(format!(
-                        "系统代理设置未全部达标：{} 等 {} 个服务",
+                        "PAC 下发未全部达标：{} 等 {} 个服务",
                         if r.mismatched.is_empty() { "原因见对账明细".to_string() } else { r.mismatched.join("、") },
                         r.mismatched.len().max(1)
                     ))
                 }
             }
-            Err(e) => Some(format!("系统代理设置失败：{e}")),
+            Err(e) => Some(format!("PAC 下发失败：{e}")),
         };
         {
             if let Some(why) = verify {
@@ -1125,9 +1226,8 @@ async fn stop_proxy(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<(),
     tauri::async_runtime::spawn_blocking(move || {
         let mihomo = MihomoManager::new();
         mihomo.stop();
-        if let Ok(r) = system_proxy::set_system_proxy(false, port) {
-            log_proxy_set_result("stop_proxy", &r);
-        }
+        let _ = port;
+        disable_all_proxy("stop_proxy");
         // P1-2：正常停止 = 接管结束，结账。
         // 注意本步只结账不回放原值——一键还原是 P1-4 的 restore_network，
         // 停止的既有语义（关系统代理回直连）保持不变，不得偷偷扩权。
@@ -1206,14 +1306,10 @@ async fn restore_network(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Resul
         } else {
             // 无账本 = 没有"接管前原值"可回。唯一诚实的动作是退回直连并说明局限。
             let mut notes = Vec::new();
-            match system_proxy::set_system_proxy(false, mihomo.port) {
-                Ok(r) => {
-                    log_proxy_set_result("restore_network", &r);
-                    if !r.all_ok {
-                        notes.push(format!("部分服务未能确认关闭：{}", r.mismatched.join("、")));
-                    }
-                }
-                Err(e) => notes.push(format!("关闭系统代理失败：{e}")),
+            let errs = system_proxy::disable_everything();
+            pac::stop();
+            if !errs.is_empty() {
+                notes.push(format!("部分服务未能确认关闭：{}", errs.join("；")));
             }
             let mut m = String::from("无未结接管账本（本机未发生过接管或账本已结），代理内核已停止，系统代理已关闭回直连");
             if !notes.is_empty() {
@@ -1265,10 +1361,11 @@ async fn reapply_takeover(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Resu
         }
         (g.mihomo.port, g.drift.clone(), g.drift_ack.clone())
     };
-    let status = tauri::async_runtime::spawn_blocking(move || system_proxy::set_system_proxy(true, port))
+    let cfg_now = state.lock().unwrap().config.clone();
+    let pacres = tauri::async_runtime::spawn_blocking(move || apply_pac_mode(&cfg_now, port, "reapply"))
         .await
         .map_err(|e| format!("reapply_takeover 线程异常: {e}"))??;
-    log_proxy_set_result("reapply", &status);
+    let status = pacres.to_status();
     if status.all_ok {
         *drift_slot.lock().unwrap() = None;
         drift_ack.store(false, Ordering::Relaxed);
@@ -1293,10 +1390,24 @@ async fn set_system_proxy(
 ) -> Result<crate::system_proxy::SystemProxyStatus, String> {
     // networksetup 可能耗时数秒，同步命令会卡主线程 → 改 async + spawn_blocking
     let port = state.lock().unwrap().mihomo.port;
-    let status =
-        tauri::async_runtime::spawn_blocking(move || system_proxy::set_system_proxy(enabled, port))
-            .await
-            .map_err(|e| format!("set_system_proxy 线程异常: {e}"))??;
+    let cfg_now = state.lock().unwrap().config.clone();
+    // v0.4.2：开关语义从「全局代理」改成「PAC 白名单」。
+    // 开 = 下发名单（只有名单内域名走代理，其余直连，代理不可用时自动回退直连）；
+    // 关 = 统一收尾（关 PAC + 关全局代理 + 清脏地址）。
+    let status = tauri::async_runtime::spawn_blocking(move || -> Result<system_proxy::SystemProxyStatus, String> {
+        if enabled {
+            Ok(apply_pac_mode(&cfg_now, port, "set_system_proxy")?.to_status())
+        } else {
+            disable_all_proxy("set_system_proxy");
+            Ok(system_proxy::SystemProxyStatus {
+                enabled: false,
+                all_ok: true,
+                ..Default::default()
+            })
+        }
+    })
+    .await
+    .map_err(|e| format!("set_system_proxy 线程异常: {e}"))??;
     // 同步更新并持久化 config.system_proxy，使 UI 开关与 config 一致。
     // 旧实现只调 networksetup 不改 config，导致 UI 开关后 start_proxy 仍按旧 config 判断，
     // 重启后系统代理状态与用户上次选择脱节。
@@ -1750,23 +1861,157 @@ pub fn start_proxy_standalone() -> Result<MihomoStatus, String> {
     let status = mihomo.start(&cfg, &[], &app_rules)?;
     // P1-A：接管必开入口（与 start_proxy 同语义）——TUN 不承载流量，
     // 系统代理是引擎唯一流量入口，不设入口的内核 = 空转摆设。
-    if let Ok(r) = system_proxy::set_system_proxy(true, mihomo.port) {
-        log_proxy_set_result("standalone", &r);
+    if let Err(e) = apply_pac_mode(&cfg, mihomo.port, "standalone") {
+        eprintln!("[standalone] PAC 下发失败: {e}");
     }
     Ok(status)
 }
 
 pub fn stop_proxy_standalone() -> Result<(), String> {
     let mihomo = MihomoManager::new();
-    let port = mihomo.port;
     // v0.4.1：用户态直接结束内核进程（stop() 内部含 PID 发现与 SIGKILL 兜底，
     // 无需特权控制器 sudoers、无需 osascript 提权——内核是普通用户进程）
     mihomo.stop();
-    // 关系统代理并回读对账；若有服务没关成，下次启动的 P0-4 自检兜底
-    if let Ok(r) = system_proxy::set_system_proxy(false, port) {
-        log_proxy_set_result("standalone", &r);
-    }
+    // v0.4.2：统一收尾（关 PAC + 关全局代理 + 清脏地址）
+    disable_all_proxy("standalone");
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 登录自愈（v0.4.2）：断电后**不依赖用户手动打开 App**
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 登录自愈 agent 的标签与路径
+pub const SELFHEAL_LABEL: &str = "com.magic.agent.selfheal";
+
+fn selfheal_plist_path() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join("Library/LaunchAgents").join(format!("{SELFHEAL_LABEL}.plist")))
+}
+
+/// 无界面自愈：登录后由 launchd 拉起，检查"内核不在但代理/PAC 还开着"，
+/// 是则全部关掉。**这是断电重启后网络能自动恢复的唯一保证**——
+/// v0.4.1 的自愈只写在 GUI 的启动路径里，用户不点开 App 就永远不执行。
+pub fn selfheal() -> i32 {
+    let kernel_up = MihomoManager::new().status().running;
+    let pac_on = system_proxy::pac_enabled_globally();
+    let legacy_on = system_proxy::status().enabled;
+    eprintln!(
+        "[selfheal] 启动自检：内核运行={kernel_up} PAC启用={pac_on} 全局代理启用={legacy_on}"
+    );
+    if kernel_up {
+        eprintln!("[selfheal] 内核在跑，不动系统设置（接管状态由 App 负责）");
+        return 0;
+    }
+    if !pac_on && !legacy_on {
+        eprintln!("[selfheal] 系统无代理/PAC 残留，无需处理");
+        return 0;
+    }
+    eprintln!("[selfheal] 检测到残留（内核已不在），清除以恢复直连");
+    let errs = system_proxy::disable_everything();
+    if errs.is_empty() {
+        eprintln!("[selfheal] 已完成：PAC 与全局代理均已关闭");
+        0
+    } else {
+        eprintln!("[selfheal] 部分失败：{}", errs.join("；"));
+        1
+    }
+}
+
+/// 无界面 DNS 体检（`--dns-check`）：输出 JSON，供脚本/支持排障直接消费。
+pub fn dns_check_json() -> String {
+    let h = dns_guard::check();
+    serde_json::to_string_pretty(&h).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
+}
+
+/// 无界面对账（`--proxy-status`）：报告当前 PAC / 全局代理现状，只读。
+pub fn proxy_status_text() -> String {
+    let pac_on = system_proxy::pac_enabled_globally();
+    let legacy = system_proxy::status();
+    let mut out = vec![
+        format!("PAC 启用: {pac_on}"),
+        format!("全局代理启用: {}", legacy.enabled),
+        format!("HTTP 端口: {} / SOCKS 端口: {}", legacy.http_port, legacy.socks_port),
+    ];
+    for svc in system_proxy::list_services() {
+        let (en, url) = system_proxy::pac_state_for(&svc);
+        out.push(format!(
+            "  {svc}: PAC={} {}",
+            if en { "on" } else { "off" },
+            if url.is_empty() { String::new() } else { format!("({url})") }
+        ));
+    }
+    out.join("\n")
+}
+
+/// 无界面修 DNS（`--repair-dns`）
+pub fn dns_repair_text() -> String {
+    match dns_guard::repair_to_dhcp(None) {
+        Ok((done, before)) => {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let after = dns_guard::check();
+            if done.is_empty() {
+                format!("没有手工写死的 DNS。当前：{}", after.note)
+            } else {
+                format!(
+                    "已把 {} 改回 DHCP（原值 {:?}）。复检：{}",
+                    done.join("、"),
+                    before,
+                    after.note
+                )
+            }
+        }
+        Err(e) => format!("修复失败: {e}"),
+    }
+}
+
+/// 安装（或刷新）登录自愈 LaunchAgent。幂等。
+/// 只在本 App 自己的用户域运行，不写 /Library，不需要 root。
+pub fn install_selfheal_agent() -> Result<String, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("取可执行路径失败: {e}"))?;
+    let path = selfheal_plist_path().ok_or("取不到用户 home 目录")?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("创建 LaunchAgents 目录失败: {e}"))?;
+    }
+    let plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{SELFHEAL_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{}</string>
+    <string>--selfheal</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><false/>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>/tmp/magic-agent-selfheal.log</string>
+  <key>StandardErrorPath</key><string>/tmp/magic-agent-selfheal.log</string>
+</dict>
+</plist>
+"#,
+        exe.display()
+    );
+    std::fs::write(&path, plist).map_err(|e| format!("写 LaunchAgent 失败: {e}"))?;
+    // 已加载则先卸载（内容变了需要重新读），忽略失败
+    let uid = unsafe { libc::getuid() };
+    let domain = format!("gui/{uid}");
+    let _ = std::process::Command::new("/bin/launchctl")
+        .args(["bootout", &domain, path.to_string_lossy().as_ref()])
+        .output();
+    let out = std::process::Command::new("/bin/launchctl")
+        .args(["bootstrap", &domain, path.to_string_lossy().as_ref()])
+        .output()
+        .map_err(|e| format!("launchctl 调用失败: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        // 已经加载过（EALREADY/5）不算失败
+        if !err.contains("already") && !err.is_empty() {
+            return Err(format!("launchctl bootstrap 失败: {err}"));
+        }
+    }
+    Ok(path.display().to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1808,10 +2053,7 @@ pub fn run() {
             let g = signal_state.lock().unwrap_or_else(|e| e.into_inner());
             g.should_run.store(false, Ordering::Relaxed);
             g.mihomo.stop();
-            match system_proxy::set_system_proxy(false, g.mihomo.port) {
-                Ok(r) => log_proxy_set_result("signal-exit", &r),
-                Err(e) => eprintln!("[magic-agent] WARN 信号退出时关闭系统代理失败: {e}"),
-            }
+            disable_all_proxy("signal-exit");
             match ledger::LedgerFile::default().settle_open("signal_exit") {
                 Ok(true) => eprintln!("[ledger] 接管已结账（signal_exit）"),
                 Ok(false) => {}
@@ -1820,6 +2062,13 @@ pub fn run() {
             std::process::exit(0);
         }
     });
+
+    // v0.4.2：装/刷新登录自愈 agent。断电重启后由它（而不是"用户记得打开 App"）
+    // 把残留的 PAC/代理关掉——这是本次事故最重要的一处补齐。
+    match install_selfheal_agent() {
+        Ok(p) => eprintln!("[selfheal-agent] 已安装/刷新: {p}"),
+        Err(e) => eprintln!("[selfheal-agent] WARN 安装失败（断电后需手动打开 App 才能自愈）: {e}"),
+    }
 
     // P0-4 启动自检：崩溃残留的"系统代理指向死端口"会整机断网，
     // 必须第一时间恢复直连并告知用户。同步跑在 setup 前（百毫秒级，
@@ -1906,14 +2155,17 @@ pub fn run() {
                     {
                         eprintln!("[watchdog] WARN begin_takeover 失败（联动不设代理，宁可不写）: {e}");
                     } else {
-                        match system_proxy::set_system_proxy(true, port) {
+                        let cfg_now = {
+                            let g = watchdog_state.lock().unwrap_or_else(|e| e.into_inner());
+                            g.config.clone()
+                        };
+                        match apply_pac_mode(&cfg_now, port, "watchdog 重启联动") {
                             Ok(r) => {
-                                log_proxy_set_result("watchdog 重启联动", &r);
                                 if !r.all_ok {
-                                    eprintln!("[watchdog] 重启后系统代理未全部达标，漂移巡检将接力提示");
+                                    eprintln!("[watchdog] 重启后 PAC 未全部达标，漂移巡检将接力提示");
                                 }
                             }
-                            Err(e) => eprintln!("[watchdog] WARN 重启后系统代理联动失败: {e}"),
+                            Err(e) => eprintln!("[watchdog] WARN 重启后 PAC 下发失败: {e}"),
                         }
                     }
                 }
@@ -1921,12 +2173,8 @@ pub fn run() {
                     // 重启失败：关掉系统代理，避免死代理端口导致全机断网。
                     // P0-1：这里若没关成是真实危险（用户即将断网），必须点名；
                     // 即便本次失败，下次 App 重启时 startup_self_check（P0-4）仍会兜底。
-                    eprintln!("[watchdog] mihomo 自动重启失败: {e}，关闭系统代理以恢复直连");
-                    let port = watchdog_state.lock().unwrap().mihomo.port;
-                    match system_proxy::set_system_proxy(false, port) {
-                        Ok(r) => log_proxy_set_result("watchdog", &r),
-                        Err(le) => eprintln!("[watchdog] WARN 关闭系统代理失败（用户可能断网，重启 App 可自愈）: {le}"),
-                    }
+                    eprintln!("[watchdog] mihomo 自动重启失败: {e}，关闭代理设置以恢复直连");
+                    disable_all_proxy("watchdog");
                 }
             }
             continue;
@@ -1964,9 +2212,10 @@ pub fn run() {
             if !MihomoManager::new().status().running {
                 continue;
             }
-            if let Some(services) = probe_drift(port, drift_ack.load(Ordering::Relaxed)) {
+            let _ = port;
+            if let Some(services) = probe_drift_pac(drift_ack.load(Ordering::Relaxed)) {
                 let ts = ledger::now_ts();
-                eprintln!("[drift] 接管期间系统代理被外部改动：{} 个服务不达标", services.len());
+                eprintln!("[drift] 接管期间 PAC 配置被外部改动：{} 个服务不达标", services.len());
                 *drift_slot.lock().unwrap() = Some(DriftNotice { services, ts });
             } else {
                 // 恢复达标（如用户调试完自己改回来）：清除旧的黄条，不留过期警报
@@ -2005,6 +2254,8 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
             get_status,
+            check_dns,
+            repair_dns,
             get_config,
             save_config,
             scan_apps,
@@ -2054,10 +2305,7 @@ pub fn run() {
                 // 断开 SSH 会话：不断开则 ssh/expect 子进程变孤儿，继续占着远端连接
                 app.state::<crate::ssh::SshManager>().disconnect();
                 // 退出收尾也要对账：没关干净的话日志点名（下次启动 P0-4 自检兜底）
-                match system_proxy::set_system_proxy(false, g.mihomo.port) {
-                    Ok(r) => log_proxy_set_result("exit", &r),
-                    Err(e) => eprintln!("[magic-agent] WARN 退出时关闭系统代理失败: {e}"),
-                }
+                disable_all_proxy("exit");
                 // P1-2：正常退出 = 接管结束，结账（与 stop_proxy 同语义，只结账不回滚）
                 match ledger::LedgerFile::default().settle_open("app_exit") {
                     Ok(true) => eprintln!("[ledger] 接管已结账（app_exit）"),
